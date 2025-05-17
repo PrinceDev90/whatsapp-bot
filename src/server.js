@@ -192,6 +192,95 @@ app.post('/send/:sessionId', upload.single('image'), async (req, res) => {
     }
 });
 
+app.post('/send-bulk/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    const { numbers, message, retryFailed = false } = req.body;
+
+    if (!Array.isArray(numbers) || numbers.length === 0 || !message) {
+        return res.status(400).json({ success: false, message: 'Invalid numbers or message' });
+    }
+
+    const session = sessions[sessionId];
+    if (!session?.isConnected) {
+        return res.status(400).json({ success: false, message: 'Session not connected' });
+    }
+
+    const sock = session.sock;
+
+    const total = numbers.length;
+    const report = [];
+
+    let successCount = 0;
+    let failCount = 0;
+    let skippedCount = 0;
+
+    const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+    for (let i = 0; i < total; i++) {
+        const number = numbers[i];
+        const jid = number.includes('@s.whatsapp.net') ? number : `${number}@s.whatsapp.net`;
+
+        console.log(`📨 Processing ${i + 1}/${total} => ${number}`);
+
+        try {
+            const [check] = await sock.onWhatsApp(jid);
+
+            if (!check?.exists) {
+                report.push({ number, status: 'skipped', reason: 'Not registered on WhatsApp' });
+                skippedCount++;
+                continue;
+            }
+
+            try {
+                await sock.sendMessage(jid, { text: message });
+                report.push({ number, status: 'sent' });
+                successCount++;
+            } catch (sendErr) {
+                console.error(`❌ Send error to ${number}:`, sendErr.message);
+
+                if (retryFailed) {
+                    console.log(`🔁 Retrying for ${number}...`);
+                    try {
+                        await delay(2000); // wait before retry
+                        await sock.sendMessage(jid, { text: message });
+                        report.push({ number, status: 'sent (retry)' });
+                        successCount++;
+                    } catch (retryErr) {
+                        report.push({ number, status: 'failed', reason: `Retry failed: ${retryErr.message}` });
+                        failCount++;
+                    }
+                } else {
+                    report.push({ number, status: 'failed', reason: sendErr.message });
+                    failCount++;
+                }
+            }
+
+        } catch (err) {
+            console.error(`⚠️ Unexpected error for ${number}:`, err.message);
+            report.push({ number, status: 'failed', reason: err.message });
+            failCount++;
+        }
+
+        // Prevent rate-limiting
+        await delay(500);
+    }
+
+    const processedCount = successCount + failCount + skippedCount;
+
+    res.status(200).json({
+        success: true,
+        summary: {
+            total,
+            processed: processedCount,
+            sent: successCount,
+            failed: failCount,
+            skipped: skippedCount
+        },
+        report
+    });
+});
+
+
 // Health check
 app.get('/', (req, res) => {
     res.send('✅ WhatsApp Multi-Session Bot Running');
